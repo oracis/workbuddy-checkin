@@ -1,0 +1,13 @@
+* text=auto eol=lf
+
+# 这些必须是 LF，否则在 Linux/macOS 上无法执行
+*.sh text eol=lf
+*.py text eol=lf
+
+# Windows 脚本用 CRLF
+*.ps1 text eol=crlf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.gif binary
