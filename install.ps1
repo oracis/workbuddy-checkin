@@ -21,8 +21,13 @@ if (-not (Test-Path $DestRoot)) {
 }
 
 if (Test-Path $Dest) {
+    # 备份到 skills 目录之外，避免残留目录被当成损坏的 skill 加载
+    $backupRoot = Join-Path (Split-Path -Parent $DestRoot) "skill-backups"
+    if (-not (Test-Path $backupRoot)) {
+        New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
+    }
     $stamp = Get-Date -Format "yyyyMMddHHmmss"
-    $backup = "$Dest.bak.$stamp"
+    $backup = Join-Path $backupRoot "$SkillName.$stamp"
     Write-Host "已存在旧版本，备份到：$backup"
     Move-Item -Path $Dest -Destination $backup
 }
