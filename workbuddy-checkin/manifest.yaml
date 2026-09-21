@@ -1,0 +1,21 @@
+name: workbuddy-checkin
+display_name: WorkBuddy 每日签到领积分
+version: 1.2.0
+author: oracis
+category: 办公效率
+license: MIT
+homepage: https://github.com/oracis/workbuddy-checkin
+description: 自动领取 WorkBuddy（原 CodeBuddy）每日签到积分，无需打开客户端 UI。支持新版加密凭据（at-rest 信封）解密，缺 build key 时自动从运行中的客户端提取（自愈），脚本幂等、零依赖（仅 Python 标准库），配合定时任务可避免漏签。接口规格已逆向并固化。
+triggers:
+  - 领积分
+  - 自动领积分
+  - 签到
+  - 每日礼包
+  - checkin
+  - 领取今日积分
+tags:
+  - 签到
+  - 积分
+  - 自动化
+  - WorkBuddy
+  - 定时任务
