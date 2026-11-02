@@ -2,7 +2,7 @@
 name: workbuddy-checkin
 slug: workbuddy-checkin
 displayName: WorkBuddy 每日签到领积分
-version: 1.2.0
+version: 1.2.1
 summary: 自动领取 WorkBuddy（原 CodeBuddy）每日签到积分，无需打开客户端 UI；支持新版加密凭据（at-rest 信封）解密，缺 build key 时自动从运行中的客户端提取（自愈），脚本幂等、零依赖，配合定时任务避免漏签。
 license: MIT
 description: 自动领取 WorkBuddy（原 CodeBuddy）每日签到积分。当用户说"领积分""自动领积分""签到""每日礼包""checkin""领取今日积分"，或定时任务要执行每日签到时使用。接口规格与脚本已固化，无需重新逆向客户端。
