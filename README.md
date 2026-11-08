@@ -1,129 +1,135 @@
 # workbuddy-checkin
 
-> WorkBuddy（原 CodeBuddy）每日签到自动领积分 Skill —— 幂等、零依赖、无需客户端在线、可无人值守。
+> WorkBuddy（原 CodeBuddy）每日签到自动领积分 —— 幂等、零依赖、可无人值守。
 
 官方积分入口需要手动点「领取今日礼包」，客户端没开着就会漏签、断掉连续签到奖励。
-这个 Skill 直接调用客户端自身使用的后端签到接口，让 AI 助手（或系统定时任务）帮你自动领。
+本项目直接调用客户端自身使用的后端签到接口，让 AI 助手（或系统计划任务）帮你自动领。
 
 - **幂等**：先查当天状态，已领则立即跳过，重复运行零副作用
 - **零依赖**：只用 Python 标准库，无需 `pip install`
-- **不碰密码**：只读取客户端已有的本地登录态，不做网络登录，不存储任何凭据
-- **自动续期**：`accessToken` 过期时用 `refreshToken` 自动换新并安全写回（排他锁 + 竞态检测 + 原子替换）
 - **无人值守**：配系统计划任务轮询，开机期间没领到就按频率重试，领到当天即收工
-- **不开客户端也能跑**：脚本只依赖本机凭据文件，不依赖客户端进程（但账号必须至少登录过一次）
+- **不碰密码**：全程只用登录态 token，不做交互式登录，不涉及账号密码
 
-## 效果
+## 本仓库有三个包，先选一个
 
-```
-$ python workbuddy-checkin/scripts/wb-checkin.py
-活动        : Buddy应用（Buddy加油站）
-期数        : 第 10 期
-时间范围      : 2026-09-30 00:00:00 ~ 2026-12-31 23:59:59
-已签到天数     : 32（本周 2 天）
-累计积分      : 3200
-今日积分      : 100
-本周进度      : ●●○○○○○
-[SKIP] 今天已经领过了，无需重复领取（今日 +100 积分）
-```
+从 1.5.0 起按**拆分架构**分发：签到能力与「读取本机客户端凭据」能力彻底分开。
+
+| 包 | 目录 | 凭据来源 | 适合谁 | 发布位置 |
+|---|---|---|---|---|
+| **主包 1.5.3** | `workbuddy-checkin/` | 用户**显式提供** token | 想要最小权限、代码与声明逐字对齐；从市场安装 | GitHub / SkillHub / ClawHub |
+| **桥接组件 1.5.3** | `workbuddy-checkin-bridge/` | 本机客户端会话（需显式同意） | 想让脚本直接用已登录的会话 | GitHub / SkillHub（**不上 ClawHub**） |
+| **完整版 1.4.1（legacy）** | `legacy/workbuddy-checkin-full/` | 自动读取本机凭据并续期写回 | 想装完就能用、不折腾凭据；本机运行时用的就是它 | 仅 GitHub |
+
+**为什么要拆**：ClawHub 的安全扫描把「签到技能里附带凭据解密 + 进程调试提取能力」判为
+*声明目的与代码能力不符*。拆开后主包只做签到，桥接组件的用途、风险和同意流程单独写明，
+由用户自己决定是否安装。完整版功能最全但能力面最大，因此不再推到市场，只留在仓库里。
+
+> 主包**不能**自己去读本机登录态。要开箱即用的自动续期与写回，请用完整版；
+> 要市场版的拆分架构，就按下面「主包 + bridge」两步装。
 
 ## 安装
-
-### 方式一：作为 WorkBuddy Skill（推荐）
-
-把 `workbuddy-checkin/` 目录整个复制到用户级 skills 目录：
 
 ```bash
 git clone https://github.com/oracis/workbuddy-checkin.git
 cd workbuddy-checkin
-
-# Windows (Git Bash) / macOS / Linux
-cp -r workbuddy-checkin ~/.workbuddy/skills/
 ```
 
-或用附带的安装脚本：
-
-```bash
-# Windows PowerShell
+```powershell
+# Windows PowerShell —— 默认装完整版（开箱即用，向后兼容）
 ./install.ps1
 
-# macOS / Linux / Git Bash
-bash install.sh
+# 装拆分版：主包 + bridge 两个 Skill 一起装
+./install.ps1 -Edition split
 ```
-
-装好后直接对 WorkBuddy 说「**帮我领积分**」即可，助手会自动加载本 Skill 完成签到。
-
-安装到项目级（团队共享）则复制到 `<项目>/.workbuddy/skills/`。
-
-### 方式二：当普通脚本用
-
-不用 Skill 机制也行，直接跑：
 
 ```bash
-python workbuddy-checkin/scripts/wb-checkin.py
+# macOS / Linux / Git Bash
+bash install.sh                          # 完整版
+bash install.sh ~/.workbuddy/skills split   # 拆分版
 ```
+
+也可以手动复制目录到 `~/.workbuddy/skills/`（项目级则放 `<项目>/.workbuddy/skills/`）。
+安装脚本遇到同名旧版本会先备份到 `skill-backups/`，不会直接覆盖。
+
+装好后对 WorkBuddy 说「**帮我领取 WorkBuddy 今日积分**」即可；只说「签到」而不指明平台时，
+助手会先跟你确认是哪个服务。
 
 ## 用法
 
-| 命令 | 作用 |
-|---|---|
-| `python wb-checkin.py` | 正常签到（幂等，已领则跳过） |
-| `python wb-checkin.py --status` | 只查状态，不领取 |
-| `python wb-checkin.py --json` | 输出原始状态 JSON，便于脚本消费 |
-| `python wb-checkin.py --force` | 强制调用领取接口（调试用） |
-| `python wb-checkin.py --no-refresh` | 禁用自动续期（排查续期链路时用） |
+### 完整版（legacy）
+
+```bash
+python legacy/workbuddy-checkin-full/scripts/wb-checkin.py            # 签到
+python legacy/workbuddy-checkin-full/scripts/wb-checkin.py --status   # 只查不领
+python legacy/workbuddy-checkin-full/scripts/wb-checkin.py --json     # 原始 JSON
+python legacy/workbuddy-checkin-full/scripts/wb-checkin.py --force    # 调试：强制领
+python legacy/workbuddy-checkin-full/scripts/wb-checkin.py --no-refresh
+```
+
+`accessToken` 过期时自动用 `refreshToken` 续期并安全写回凭据文件（排他锁 + 竞态检测 +
+原子替换 + `.wb-bak` 备份；客户端在运行时不写回）。
+
+### 拆分版：主包 + bridge
+
+主包只认两个显式入口，都没有就明确报错，**绝不回退去翻系统里的其它文件**：
+
+| 入口 | 环境变量 | 说明 |
+|---|---|---|
+| 直接给 token | `WB_ACCESS_TOKEN` | 可另配 `WB_REFRESH_TOKEN`、`WB_USER_ID`、`WB_DOMAIN` |
+| 指定 JSON 文件 | `WB_TOKEN_FILE` | `{"accessToken","refreshToken","uid","domain"}`；拒绝符号链接 |
+
+```bash
+# 1) 显式同意，把本机会话解密成 JSON（bridge 不会自动运行）
+python workbuddy-checkin-bridge/scripts/bridge.py --confirm --out C:/secure/token.json
+
+# 2) 主包读该文件完成签到
+WB_TOKEN_FILE=C:/secure/token.json python workbuddy-checkin/scripts/wb-checkin.py
+```
+
+bridge 输出的 JSON 等同账号登录凭证，用完即删。不落盘也可省略 `--out`，bridge 会把
+一行 JSON 打到 stdout 由你自己处理（主包不会去执行 bridge，也不会读它的 stdout）。
 
 退出码：`0` = 成功领取 / 今日已领 / 活动未开启；`1` = 失败。
 
-环境变量：
+## 配定时任务：必须用系统级调度
 
-| 变量 | 说明 |
-|---|---|
-| `WB_AUTH_DIR` | 手动指定凭据目录（自动探测失败时用） |
-| `WB_ENDPOINT` | 覆盖后端地址，默认 `https://copilot.tencent.com` |
-| `WB_NODE` | 自愈提取 build key 时指定 Node.js 可执行文件 |
-
-## 配定时任务：优先用系统计划任务，别只依赖客户端定时任务
-
-**这是最容易踩的坑（2026-11-08 实测）**：WorkBuddy 的「定时任务」是 `LocalAutomationScheduler`
-本地调度，**只有客户端进程在运行时才会触发**。客户端没开＝任务完全不执行；客户端在任务运行中被关掉，
-那次 run 会一直挂住，下次启动被判定 `ErrorAutomation-MissedWindow` 直接放弃
-（实测挂过 **144.9 小时**，导致连续 5 天漏签、损失 500 积分）。
+**这是最容易踩的坑（2026-11-08 实测）**：WorkBuddy 的「定时任务」是
+`LocalAutomationScheduler` 本地调度，**只有客户端进程在运行时才会触发**。客户端没开＝任务
+完全不执行；任务运行中被关掉，那次 run 会一直挂住，下次启动被判定
+`ErrorAutomation-MissedWindow` 直接放弃（实测挂过 **144.9 小时**，导致连续 5 天漏签、500 积分）。
 
 脚本本身零客户端依赖，所以要真正做到「不开客户端也能领」，调度必须交给操作系统。
 
 ### 推荐：轮询 + 当日守卫
 
 语义：**开机期间按频率轮询，今天没领到就继续试，领到了当天立刻收工**（一天只领一次）。
-随包提供 `scripts/wb-checkin-guard.py`：
+主包与完整版都随包提供 `scripts/wb-checkin-guard.py`：
 
-```python
-if read_mark().get("date") == today():
-    return 0                      # 今天已领：不联网、不写日志、约 380ms 静默退出
-out = run([PY, "-u", "wb-checkin.py"])          # 未领才真的跑
-if "[OK]" in out or "[SKIP]" in out:            # [SKIP] = 别处已领，同样算今天完成
-    write_mark({"date": today(), "result": headline})
-else:
-    log("FAILED\n" + out)                       # [FAIL] 不写标记 → 下个周期自动重试
+```text
+marker 日期 == 今天  -> 立刻退出（不联网、不写日志，约 0.4~0.9 秒）
+否则跑 wb-checkin.py -> [OK] / [SKIP] 写 marker；[FAIL] 不写，下个周期重试
 ```
 
-部署要点（完整 XML 与逐条说明见 [`workbuddy-checkin/SKILL.md`](workbuddy-checkin/SKILL.md) 的「调度方式」）：
+部署要点：
 
-1. 把 `wb-checkin.py` 与 `wb-checkin-guard.py` 放到同一目录（如 `~/.workbuddy/scripts/`）
-2. Windows：用 `schtasks` 导入 XML，`CalendarTrigger` + `Repetition`（每 30 分钟，覆盖全天），
-   `StartWhenAvailable=true`（关机错过则开机补跑），动作用 **`pythonw.exe`**（无黑窗）
+1. 把 `wb-checkin.py` 与 `wb-checkin-guard.py` 放同一目录（如 `~/.workbuddy/scripts/`）
+2. Windows：用 `schtasks` 导入 XML，`CalendarTrigger` + `Repetition`（每 30 分钟覆盖全天），
+   `StartWhenAvailable=true`（关机错过则开机补跑），动作用 **`pythonw.exe`**（无黑窗）。
+   XML 需 UTF-16 编码、`<StartBoundary>` 不晚于当天
 3. macOS / Linux：cron 每 30 分钟调守卫，例如
 
    ```cron
    */30 * * * * /usr/bin/python3 /path/to/wb-checkin-guard.py
    ```
 
-4. 用守卫时**别再让 WorkBuddy 内置定时任务也跑签到**，两边语义冲突（建议把客户端任务暂停）
+4. 用守卫时**别再让 WorkBuddy 内置定时任务也跑签到**，两边语义冲突（建议暂停客户端任务）
 
 > Git Bash 里 `schtasks` 参数要写双斜杠（`//create`、`//query`），否则 `/create` 会被 MSYS 当路径转换。
 
-如果仍想用 WorkBuddy 内置定时任务：RRULE 的 `BYHOUR` 只接受**单个整数**
-（`BYHOUR=9,21` 会被拒），要多时段请用 `FREQ=HOURLY;INTERVAL=8`。请明确接受
-「客户端不在线就不触发」这一限制。
+守卫的路径安全（1.5.3 起）：解释器只从两个显式可信候选中选取；脚本、marker、日志及所在目录
+逐段校验，**链接检查先于 `realpath`**（否则指向外部文件的链接会被解析成看似正常的目标），
+解析后还要求目标仍在技能目录内；读写走 `O_NOFOLLOW` + fd 复核，Windows 无该标志时改用
+reparse point 属性位。子进程 argv 全是代码内常量、`shell=False`。
 
 ## 工作原理
 
@@ -131,56 +137,66 @@ else:
 
 | 项 | 值 |
 |---|---|
-| 后端 endpoint | `https://copilot.tencent.com`（取自 `cli/product.json → endpoint`，可用 `WB_ENDPOINT` 覆盖） |
+| 后端 endpoint | `https://copilot.tencent.com`（取自 `cli/product.json → endpoint`），备用 `https://www.workbuddy.cn` |
 | 查询状态 | `POST /v2/billing/meter/checkin-activity-status`，body `{}` |
 | 领取积分 | `POST /v2/billing/meter/daily-checkin`，body `{}` |
-| 令牌续期 | `POST /v2/plugin/auth/token/refresh`，header `X-Refresh-Token` + `X-Auth-Refresh-Source: plugin`（注意必须带 `/plugin` 前缀，另一条路径是 404） |
+| 令牌续期 | `POST /v2/plugin/auth/token/refresh`，header `X-Refresh-Token` + `X-Auth-Refresh-Source: plugin` |
 | 鉴权 | `Authorization: Bearer <accessToken>` + `X-User-Id` + `X-Domain` |
 
-**凭据来源**：客户端把登录态存在
-`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\*.info`。
-新版客户端用 AES-256-GCM 的 at-rest 信封加密 token 字段，由 `scripts/at_rest.py` 解密
-（零依赖纯 Python 实现；缺 build key 时会从运行中的客户端自动提取）。
-脚本取其中**最新可用**的会话文件，读 `auth.accessToken` / `auth.refreshToken` / `account.uid` / `auth.domain`。
-
-`accessToken` 过期时脚本会自动续期并把新 token 加密写回凭据文件。写回有四道保护：
-客户端在运行时不写、写前重读做竞态检测、`O_EXCL` 排他锁、临时文件 + `os.replace()` 原子替换
-（另留 `*.wb-bak` 备份）。只有 `auth` 段里的 token 与时间戳会被改动。
+主包把域名**硬编码为白名单**（仅这两个官方域名，强制 HTTPS + 443、禁 userinfo、禁重定向），
+没有任何环境变量或开关能放行到其它主机；`WB_ENDPOINT` 只能在两者间切换。续期得到的新 token
+只在本次进程内使用，**不落盘**。完整版额外负责读取/解密本机凭据与写回续期结果。
 
 逆向过程中的几个坑，留给后来者：
 
-1. 共享数据目录常量名是 **`CodeBuddyExtension`**，不是 `WorkBuddyExtension`（`EXTENSION_DATA_DIR_NAME`）
+1. 共享数据目录常量名是 **`CodeBuddyExtension`**，不是 `WorkBuddyExtension`
 2. Electron 的 `session/Local Storage` 里**没有** token，翻了是白费功夫
 3. refresh 端点必须走 `/v2/plugin/...`；用 `/v2/auth/token/refresh` 返回 404
 4. 签到接口**没有补签/补卡端点** —— 漏掉的日期追不回来，只能靠调度避免再漏
+5. 在多个工作区各建一个同名系统任务会双跑，两边回报的累计数据对不上，排查时极易误判
 
-完整接口字段说明见 [`workbuddy-checkin/SKILL.md`](workbuddy-checkin/SKILL.md)。
+完整字段说明见各包自己的 `SKILL.md`。
 
 ## 常见问题
 
-**Q：报 `[FAIL]` + HTTP 401/403？**
-正常情况下脚本会自动用 `refreshToken` 续期并重试，无需人工干预。
-只有当连 `refreshToken` 也过期（通常约 60 天完全没开过客户端）时才会失败，
-这时打开一次 WorkBuddy 客户端重新登录即可恢复。
+**Q：`[FAIL]` + HTTP 401/403？**
+完整版会自动续期并重试；只有连 `refreshToken` 也过期时才会失败，打开一次客户端重新登录即可。
+拆分版请重新提供有效凭据（或重跑一次 bridge）。
 
 **Q：报「凭据加载失败」？**
-报错里会列出所有尝试过的目录与被跳过文件的原因。先确认已登录过客户端；
-非 Windows 平台的路径尚未实测，可用 `WB_AUTH_DIR` 手动指定。
+完整版会列出所有尝试过的目录与跳过原因，先确认至少登录过一次客户端，或用 `WB_AUTH_DIR` 指定。
+拆分版请检查 `WB_ACCESS_TOKEN` / `WB_TOKEN_FILE` 是否设置。
 
 **Q：一直输出 `[SKIP]`？**
-说明当天已经领过（可能你手动点过，或上一次定时任务已经领了），这是正常的幂等行为。想看详情用 `--status`。
+当天已经领过（可能手动点过，或定时任务已领），这是正常的幂等行为。想看详情用 `--status`。
 
 **Q：会不会重复领 / 被判异常？**
-脚本先查状态再决定是否调领取接口，已领就不会发起领取请求，调用序列和客户端点按钮一致。
-守卫脚本还会额外用当日标记拦截重复轮询。
+先查状态再决定是否调领取接口，已领就不发起领取请求，调用序列和客户端点按钮一致。
+守卫脚本还会用当日标记额外拦截重复轮询。
 
 **Q：安全吗？**
-脚本只读本地已有的凭据文件，不发送账号密码，不上传 token 到任何第三方，全部请求只发往官方 endpoint。
-续期与写回的实现是公开的（见 `scripts/wb-checkin.py` 与 `scripts/at_rest.py`），建议自己过一遍。
+主包只访问官方白名单域名，不读本机凭据、不写登录态、不启动额外子进程；bridge 只在用户
+显式同意后运行，build key 只在内存中使用、不落盘、不向外部网络发送任何数据。
+所有实现都是公开的，建议自己过一遍再装。
+
+## 版本与发布
+
+| 平台 | 条目 | 版本 | 内容 |
+|---|---|---|---|
+| ClawHub | `oracis/workbuddy-checkin` | 1.5.3 | 主包 |
+| SkillHub | `workbuddy-checkin` | 1.5.3 | 主包 |
+| SkillHub | `workbuddy-checkin-bridge` | 1.5.3 | bridge（独立条目） |
+| GitHub | 本仓库 `main` | 1.5.3 | 主包 + bridge + legacy 完整版 |
+
+1.5.3 相对 1.5.2 的改动：修复守卫脚本 marker/log 的链接绕过缺陷（保留词法路径、
+链接检查前置于 `realpath`、`O_NOFOLLOW` + fd 复核），并移除主包的 token provider
+子进程分支（主脚本全程零子进程）。1.4.1 完整版**保持原样**，本机运行时不受影响。
 
 ## 免责声明
 
-本项目基于对客户端的本地行为分析实现，仅用于**自动化本人账号的正常签到操作**，不涉及绕过任何付费、额度或风控限制。接口由官方维护，可能随版本变更而失效。使用者需自行确认符合所用服务的用户协议，风险自负。
+本项目基于对客户端的本地行为分析实现，仅用于**自动化本人账号的正常签到操作**，不涉及绕过
+任何付费、额度或风控限制。接口由官方维护，可能随版本变更而失效。使用者需自行确认符合所用
+服务的用户协议，风险自负。
 
 ## License
 

@@ -1,0 +1,18 @@
+name: workbuddy-checkin-bridge
+display_name: WorkBuddy 签到 · 登录态桥接组件
+version: 1.5.3
+author: oracis
+category: 开发者工具
+license: MIT
+homepage: https://github.com/oracis/workbuddy-checkin
+description: 独立可选组件，需用户显式运行并同意。把本机 WorkBuddy 客户端的已登录会话解密成标准 JSON 凭据，供 workbuddy-checkin 主包使用。只读凭据、不写回登录态、build key 仅内存使用、不打印密钥；可选从运行中的客户端进程提取 build key，无论成败都关闭 inspector。不自动运行、不做网络请求。
+triggers:
+  - WorkBuddy 签到读取本机登录态
+  - workbuddy-checkin-bridge
+  - 生成 WorkBuddy 签到用的 token 文件
+  - WorkBuddy at-rest 凭据解密
+tags:
+  - WorkBuddy
+  - 凭据桥接
+  - at-rest
+  - 可选组件
