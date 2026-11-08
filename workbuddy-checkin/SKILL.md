@@ -2,8 +2,8 @@
 name: workbuddy-checkin
 slug: workbuddy-checkin
 displayName: WorkBuddy 每日签到领积分
-version: 1.2.1
-summary: 自动领取 WorkBuddy（原 CodeBuddy）每日签到积分，无需打开客户端 UI；支持新版加密凭据（at-rest 信封）解密，缺 build key 时自动从运行中的客户端提取（自愈），脚本幂等、零依赖，配合定时任务避免漏签。
+version: 1.4.1
+summary: 自动领取 WorkBuddy（原 CodeBuddy）每日签到积分，无需打开客户端 UI；支持新版加密凭据（at-rest 信封）解密，缺 build key 时自动从运行中的客户端提取（自愈）；token 过期能用 refreshToken 自动续期并安全写回（排他锁 + 竞态检测 + 原子替换）；附系统计划任务轮询方案（pythonw + 当日守卫），开机期间没领到就每 30 分钟重试、领到当天即收工。脚本幂等、零依赖。
 license: MIT
 description: 自动领取 WorkBuddy（原 CodeBuddy）每日签到积分。当用户说"领积分""自动领积分""签到""每日礼包""checkin""领取今日积分"，或定时任务要执行每日签到时使用。接口规格与脚本已固化，无需重新逆向客户端。
 category: office-efficiency
@@ -36,6 +36,7 @@ python "<SKILL_DIR>/scripts/wb-checkin.py"
 | `--status` | 只查状态不领取 |
 | `--json` | 输出原始状态 JSON（便于程序消费） |
 | `--force` | 强制调领取接口（调试用） |
+| `--no-refresh` | 禁止自动续期登录态（只读本地凭据，排障用） |
 
 退出码：`0` = 成功领取 / 今日已领 / 活动未开启；`1` = 失败（鉴权失效、凭据缺失、接口异常）。
 
@@ -64,7 +65,8 @@ python "<SKILL_DIR>/scripts/wb-checkin.py"
 
 | 现象 | 处置 |
 |---|---|
-| `[FAIL]` + HTTP 401/403 | `accessToken` 过期。告诉用户「请打开一次 WorkBuddy 客户端让它刷新登录态，之后会自动恢复」。**不要**改脚本、动凭据文件、或尝试重新登录 |
+| `[INFO] 已自动续期…` | 正常。脚本发现 token 邻近/已过期，自己换新了，无需干预。看后缀判断是否落盘：`并写回凭据文件` = 下次直接可用；`客户端在运行，本次不写回` = 仅本次生效，客户端会自己续 |
+| `[FAIL]` + HTTP 401/403（且已尝试续期） | 续期也失败：多为 refreshToken 也过期（约 60 天未开客户端）。告诉用户「请打开一次 WorkBuddy 客户端重新登录，之后会自动恢复」。**不要**改脚本、动凭据文件、或尝试重新登录 |
 | `[FAIL] 凭据加载失败` | 报错信息里已列出所有尝试过的目录与被跳过的文件原因。若含 `client_not_running`，让用户启动客户端后重跑；非 Windows 平台可用 `WB_AUTH_DIR` 指定凭据目录 |
 | `[WARN] 自动提取 build key 失败` | 看 hint：`client_not_running` → 启动客户端重跑；`node_not_found` → 装 Node.js 或设 `WB_NODE` |
 | 报 `keyId mismatch` 且自愈也没救回来 | 客户端换了 build key 且提取失败。先确认客户端在跑、Node 可用；仍不行则按上文手动链路排查 |
@@ -76,6 +78,7 @@ python "<SKILL_DIR>/scripts/wb-checkin.py"
 - 后端 `endpoint`：`https://copilot.tencent.com`（取自 `cli/product.json -> endpoint`，可用 `WB_ENDPOINT` 覆盖）
 - 查状态：`POST /v2/billing/meter/checkin-activity-status`，body `{}`
 - 领积分：`POST /v2/billing/meter/daily-checkin`，body `{}`
+- 续期（见下节）：`POST /v2/plugin/auth/token/refresh`，body `{}`
 - 请求头（缺 `Authorization` 必 401）：
   - `Authorization: Bearer <accessToken>`
   - `X-User-Id: <uid>`
@@ -98,6 +101,51 @@ python "<SKILL_DIR>/scripts/wb-checkin.py"
 | `activity_name` / `theme_name` | 活动名 / 主题名 |
 | `season` | 期数 |
 | `start_time` / `end_time` | 活动时间范围 |
+
+## 登录态自动续期（1.3.0 起）
+
+`accessToken` 只有 **30 天**寿命（`expiresIn` 2592000），`refreshToken` **60 天**。原先 token 一过期脚本就只能报 401、等用户开客户端；现在会自己续。
+
+### 触发时机
+
+不靠定时，靠**两层判断**：
+
+1. **事前预判**：读凭据时解析 JWT 的 `exp`，若剩余 < 30 分钟，先续期再签到（避免签到途中恰好过期）。
+2. **事后兜底**：任意接口返回 401/403，立即续期并重试该请求一次。
+
+token 仍然有效时，不发任何额外请求 —— 正常路径零开销。
+
+### 续期接口（逆向自 `app.asar`，已实测）
+
+```
+POST /v2/plugin/auth/token/refresh
+X-Refresh-Token: <refreshToken 明文>
+X-Auth-Refresh-Source: plugin
+X-User-Id / X-Domain: 同签到接口
+body: {}
+```
+
+- `prefixPath` 来自 `cli/product.json -> authentication.attributes.prefixPath`（值 `/plugin`）
+- **`/v2/auth/token/refresh` 是 404**，漏了 `/plugin` 必失败
+- 响应 `data` 字段：`accessToken` / `refreshToken` / `expiresIn` / `refreshExpiresIn` / `tokenType` / `domain` / `sessionState` / `scope` / `notBeforePolicy`
+- `sessionState` 每次刷新都会变，必须一并写回，否则客户端会认为会话不一致
+
+### 写回策略（安全边界）
+
+新 token 要落盘才有意义，但凭据文件是**客户端的资产**，不能写坏。四道保护：
+
+| 保护 | 做法 |
+|---|---|
+| 客户端在跑就不写 | 客户端可能随时重写该文件。此时只把新 token 用于本次运行，不落盘（`[INFO] …客户端在运行，本次不写回`） |
+| 竞态检测 | 写前重读文件，若 `accessToken` 已和读入时不同，说明客户端抢先更新了 → 放弃写回（`凭据已被客户端更新`） |
+| 排他锁 | 同目录 `O_EXCL` 锁文件，防两个定时任务并发写；锁超过 120s 视为陈旧可接管 |
+| 原子替换 + 备份 | 写 `.wb-tmp` → `os.replace()`；写前留一份 `.wb-bak` |
+
+只改 `auth` 里的 token 与时间戳字段，其余原样保留（`account` / `accounts` / `allAccounts`、`nickname`/`phoneNumber` 等其它加密字段都不碰）。
+字段加密形态跟着原字段走：原来是信封就 `at_rest.seal()` 加密，原来是明文就写明文。
+
+> **轮换语义实测**：旧 `refreshToken` 在新 token 签发后**仍然可用**（连打两次均 200），
+> 所以从外部续期不会让正在运行的客户端掉线。这也是"客户端在跑时不写回"能成立的前提。
 
 ## 凭据位置
 
@@ -133,7 +181,12 @@ AAD      = "WB-AAD\0" + [1] + L("WBEV1") + L("sym-v1") + u32(suite) + L(keyId) +
 ```
 
 解密由同目录 `at_rest.py` 完成（零依赖，内置纯 Python AES-GCM；若环境有 `cryptography` 则优先用它）。
-自测覆盖：FIPS-197 AES-256 向量、GCM spec 向量（空 AAD / 带 AAD）、篡改检测，并与 OpenSSL 后端做 200 组随机交叉校验。
+自测覆盖：FIPS-197 AES-256 向量、GCM spec 向量（空 AAD / 带 AAD）、篡改检测、加解密双向往返、nonce 随机性、错密钥拒绝，并与 OpenSSL 后端做 200 组随机交叉校验。
+
+同一模块也提供**加密侧**（续期写回 token 用）：
+
+- `seal_field(plaintext, secret=None)` → 信封 base64（字段名/顺序与客户端一致）
+- `seal(value, secret=None)` → 完整 `{"$wbEncrypted":1,"envelope":...}`，是 `unwrap()` 的逆操作
 
 **build key 是构建级常量**（同版本全安装一致），取出一次即可离线复用：
 
@@ -194,12 +247,67 @@ node "<SKILL_DIR>/scripts/extract_buildkey.js" 9229  # 3) 提取并写 at_rest_b
 加密信封走 `at_rest.unwrap()` 解密；**解密失败会自动回退到目录里的历史明文 token**，
 所以即使 build key 失效（客户端升级换 key），只要还有未过期的明文备份就仍能签到。
 
+## 调度方式：客户端定时任务 vs 系统计划任务
+
+**关键区别（2026-11-08 实测踩坑）**：WorkBuddy 的「定时任务」是 `LocalAutomationScheduler` 本地调度，
+只有**客户端进程在运行**时才会触发。客户端没开 = 任务完全不执行；客户端被关在任务运行中 = 该次 run 会挂住，
+下次启动时被判定 `ErrorAutomation-MissedWindow` 并直接放弃（实测挂过 **144.9 小时**，导致连续 5 天漏签）。
+
+所以要真正做到「不开客户端也能领」，必须用操作系统级计划任务，脚本本身零客户端依赖。
+
+### Windows：schtasks 轮询 + 当日守卫（推荐，已在本机部署为 `WorkBuddyCheckin`）
+
+目标语义：**开机期间按频率轮询，今天没领到就继续试，领到了当天立刻收工**（一天只领一次）。
+靠一个守卫脚本 `wb-checkin-guard.py` + `checkin-done.json` 标记实现，用 `pythonw.exe` 启动，全程无窗口。
+
+1. 守卫脚本随包提供：`scripts/wb-checkin-guard.py`，把它和 `wb-checkin.py` 一起放到
+   `~/.workbuddy/scripts/` 下（该目录与 `~/.workbuddy/binaries/` 同级，守卫里的解释器相对路径才成立）。
+   核心逻辑：
+
+```python
+if read_mark().get("date") == today():
+    return 0                      # 今天已领，本周期直接退出：不联网、不写日志、约 380ms
+out = run([PY, "-u", "wb-checkin.py"])          # 未领才真的跑
+if "[OK]" in out or "[SKIP]" in out:            # [SKIP] = 客户端/别处已领，同样算今天完成
+    write_mark({"date": today(), "total": ..., "result": headline})
+else:
+    log("FAILED\n" + out)                       # [FAIL] 不写标记 → 下个周期自动重试
+```
+
+2. 任务用 `CalendarTrigger` + `Repetition`（`Interval=PT30M`，`Duration=PT23H55M`，`DaysInterval=1`），
+   `StartWhenAvailable=true`（关机/休眠错过就开机补跑）。用 XML 导入：
+
+```bash
+# XML 必须是 UTF-16，<StartBoundary> 写今天或更早的 00:05，否则当天的轮询窗口不生效
+schtasks //create //tn "WorkBuddyCheckin" //xml "C:\Users\DELL\.workbuddy\scripts\WorkBuddyCheckin.xml" //f
+schtasks //query  //tn "WorkBuddyCheckin" //v //fo LIST   # 确认 Next Run 在 30 分钟内
+schtasks //run    //tn "WorkBuddyCheckin"                 # 立即触发验证
+```
+
+3. 注意事项
+   - **一定要用 `pythonw.exe`**：`python.exe` / `cmd.exe` 是控制台程序，每次触发都会闪一下黑窗，
+     `pythonw.exe` 无窗口。想用 VBS/wscript 隐藏也不行——LOLBin 会被 WorkBuddy 安全策略拦截
+   - `schtasks` 在 Git Bash 里必须写双斜杠 `//create`，否则 `/create` 会被 MSYS 当路径转换
+   - 默认只在用户已登录 Windows 时运行（不需要 WorkBuddy 登录，但需要 Windows 会话）
+   - 删除：`schtasks //delete //tn "WorkBuddyCheckin" //f`；删掉后记得把 WorkBuddy 定时任务恢复
+   - 日志 `checkin-os.log`（已领的轮询不留痕，只记真正执行/失败），标记 `checkin-done.json`
+   - 想手动跑一次看输出：`python wb-checkin.py`（不要走守卫，守卫会被标记挡掉）
+
+**建议**：系统轮询作主，WorkBuddy 客户端定时任务可**暂停**（否则一天里又会被触发几次，与"领到就收工"冲突）。
+但**不要在两个不同工作区各建一个同名任务**——会双跑，且两边回报的累计数据可能对不上（实测遇到过），排查时极易误判。
+
 ## 注意
 
-- 脚本只读取本地凭据文件，不做网络登录，也不会把 token 写到任何地方
+- 脚本不需要客户端**正在运行**：只要本机有凭据文件 + build key 缓存，就能离线签到
+- 「从未登录过」无法签到 —— 凭据来自登录，凭空造不出来
+- 续期用 `refreshToken`，全程不涉及账号密码，也不做交互式登录
+- 写回凭据时只动 `auth` 里的 token/时间戳，**客户端在运行时不写回**（详见"写回策略"）
 - build key 等同本机凭据的解密钥匙，`at_rest_buildkey.json` 不要外传；**本 skill 不附带任何密钥**，
   每个用户由自愈链路提取自己客户端的那一份
 - 自愈需要「客户端在运行 + 本机有 Node.js」；两者都没有时不会崩，会优雅降级到明文 token 回退
 - **执行方式**：主流程只用 Python 标准库；仅自愈阶段会调用一次 `node`（`buildkey_cdp.js`）
-- 建议配合定时任务每几小时跑一次：脚本幂等，多跑无副作用，可避免客户端不常开而漏签断连续奖励
-- 若配 RRULE 定时：`BYHOUR` 只接受单个整数，`BYHOUR=9,21` 这种写法会被拒；要多时段请用 `FREQ=HOURLY;INTERVAL=n`
+- 调度见上节「调度方式」：**优先用系统计划任务轮询 + 当日守卫**，别只依赖 WorkBuddy 客户端定时任务
+  （客户端不运行就完全不触发，实测连续漏签 5 天）。脚本幂等，未领时多跑无副作用，领到后守卫会当天静默收工
+- 若仍要配 WorkBuddy 内置 RRULE 定时：`BYHOUR` 只接受单个整数，`BYHOUR=9,21` 会被拒；
+  要多时段请用 `FREQ=HOURLY;INTERVAL=n`
+- 凭据写回会在同目录留下 `*.wb-bak`（写前备份），可随时手工回滚；`*.wb-lock` / `*.wb-tmp` 正常不会残留

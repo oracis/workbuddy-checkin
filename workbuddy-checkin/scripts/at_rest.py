@@ -250,6 +250,17 @@ def _aes_gcm_decrypt(key, nonce, ct_with_tag, aad):
         return _gcm_decrypt(key, nonce, ct_with_tag, aad)
 
 
+# ---------------------------------------------------------------- 对外加密接口
+def _aes_gcm_encrypt(key, nonce, plaintext, aad):
+    """加密并返回 ciphertext||tag（与解密端输入的拼接顺序一致）。"""
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        return AESGCM(key).encrypt(nonce, plaintext, aad)
+    except ImportError:
+        ct, tag = _gcm_crypt(key, nonce, plaintext, aad)
+        return ct + tag
+
+
 def buildkey_candidates():
     """build key 缓存文件的查找顺序：环境变量 > 本模块同目录 > ~/.workbuddy/scripts。"""
     here = os.path.dirname(os.path.abspath(__file__))
@@ -302,6 +313,35 @@ def unwrap(value, secret=None):
     raise ValueError("无法识别的凭据字段类型：%s" % type(value).__name__)
 
 
+def seal_field(plaintext, at_rest_secret_key_b64=None, suite=1):
+    """加密一个字段，返回客户端同格式的信封 base64（ciphertext+authTag 分开存）。"""
+    if isinstance(plaintext, bytes):
+        plaintext = plaintext.decode("utf-8")
+    if not isinstance(plaintext, str):
+        raise ValueError("plaintext 必须是 str，收到 %s" % type(plaintext).__name__)
+    secret = at_rest_secret_key_b64 or load_build_key()
+    k0 = derive_k0(secret)
+    key_id = key_id_of(k0)
+    nonce = os.urandom(12)
+    aad = build_aad(key_id, suite, "field")
+    blob = _aes_gcm_encrypt(k0, nonce, plaintext.encode("utf-8"), aad)
+    ct, tag = blob[:-16], blob[-16:]
+    env = {
+        "suite": suite,
+        "keyId": key_id,
+        "nonce": base64.b64encode(nonce).decode(),
+        "authTag": base64.b64encode(tag).decode(),
+        "ciphertext": base64.b64encode(ct).decode(),
+    }
+    return base64.b64encode(
+        json.dumps(env, separators=(",", ":")).encode("utf-8")).decode()
+
+
+def seal(value, secret=None):
+    """unwrap 的逆操作：把明文字符串包成 {"$wbEncrypted":1,"envelope":...}。"""
+    return {"$wbEncrypted": 1, "envelope": seal_field(value, secret)}
+
+
 # ---------------------------------------------------------------- 自测
 def _self_test():
     # 1) AES-256 单块 FIPS-197 向量
@@ -349,7 +389,24 @@ def _self_test():
         raise AssertionError("tag 篡改未被检测到")
     except ValueError:
         pass
-    print("SELF-TEST OK: AES-256/GCM 向量 + AAD/suite 一致 (keyId=%s)" % kid)
+
+    # 4) 加密侧：seal_field -> decrypt_field 回读一致，且信封字段与客户端同名
+    env_b64 = seal_field(plaintext, secret_b64)
+    raw = json.loads(base64.b64decode(env_b64))
+    assert set(raw) == {"suite", "keyId", "nonce", "authTag", "ciphertext"}, "信封字段名不符: %s" % sorted(raw)
+    assert raw["suite"] == 1 and raw["keyId"] == kid, "信封 suite/keyId 不符"
+    assert decrypt_field(env_b64, secret_b64) == plaintext, "seal_field round-trip 失败"
+    assert unwrap(seal(plaintext, secret_b64), secret_b64) == plaintext, "seal/unwrap round-trip 失败"
+    # 每次 nonce 必须不同（否则 GCM 安全性崩坏）
+    assert seal_field(plaintext, secret_b64) != seal_field(plaintext, secret_b64), "nonce 未随机化"
+    # 用错密钥解密必须失败
+    try:
+        decrypt_field(env_b64, base64.b64encode(b"another-key-payload-000000000000").decode())
+        raise AssertionError("错误 build key 未被拒绝")
+    except ValueError:
+        pass
+
+    print("SELF-TEST OK: AES-256/GCM 向量 + AAD/suite 一致 + 加解密双向往返 (keyId=%s)" % kid)
 
 
 if __name__ == "__main__":

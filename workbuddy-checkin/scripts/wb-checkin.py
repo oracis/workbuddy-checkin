@@ -44,6 +44,9 @@ if _HERE not in sys.path:
 DEFAULT_ENDPOINT = "https://copilot.tencent.com"
 STATUS_PATH = "/v2/billing/meter/checkin-activity-status"
 CLAIM_PATH = "/v2/billing/meter/daily-checkin"
+# 续期端点：来自客户端 app.asar 的 external-link auth（prefixPath=/plugin）
+# 注意 /v2/auth/token/refresh 是 404，前缀 /plugin 不可省
+REFRESH_PATH = "/v2/plugin/auth/token/refresh"
 
 # 客户端共享数据目录名（源码常量 EXTENSION_DATA_DIR_NAME）
 # 注意：是 CodeBuddyExtension，不是 WorkBuddyExtension
@@ -173,12 +176,25 @@ def _scan_cred():
             if not isinstance(token, str) or token.count(".") < 2:
                 rejected.append("%s: 解出的不是 JWT" % os.path.basename(f)[:48])
                 continue
+
+            # refreshToken 只用于续期，解不开不算致命（老版本可能没有）
+            refresh = None
+            raw_refresh = auth.get("refreshToken")
+            if raw_refresh:
+                try:
+                    refresh = at_rest.unwrap(raw_refresh) if at_rest else (
+                        raw_refresh if isinstance(raw_refresh, str) else None)
+                except Exception:
+                    refresh = None
+
             return {
                 "cred": {
                     "file": f,
                     "token": token,
+                    "refresh": refresh,
                     "uid": acct.get("uid") or auth.get("uid"),
                     "domain": auth.get("domain"),
+                    "data": data,          # 原始文件内容，写回时保留其它字段
                 },
                 "rejected": rejected,
                 "tried": tried,
@@ -256,6 +272,225 @@ def call(path, cred, endpoint):
         return 0, {"raw": "网络不可达: %s" % e.reason}
 
 
+# ---------------------------------------------------------------- 登录态续期
+def client_running():
+    """客户端主进程是否在跑。用于判断「外部续期是否会与客户端抢 token」。"""
+    try:
+        import buildkey_bootstrap
+        pids = buildkey_bootstrap.candidate_pids()
+        return bool(pids)
+    except Exception:
+        return False
+
+
+def _claim_lock(lock_path, stale_seconds=120):
+    """取一个基于 O_EXCL 的排他锁，避免与定时任务/手动并发写凭据。"""
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        # 陈旧锁（进程已死或超时）直接接管
+        try:
+            if time.time() - os.path.getmtime(lock_path) > stale_seconds:
+                os.unlink(lock_path)
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                return True
+        except Exception:
+            pass
+        return False
+
+
+def _release_lock(lock_path):
+    try:
+        os.unlink(lock_path)
+    except Exception:
+        pass
+
+
+def _now_ms():
+    return int(time.time() * 1000)
+
+
+def refresh_session(cred, endpoint):
+    """用 refreshToken 换新的 accessToken/refreshToken。
+
+    返回 (ok, info)。info 里要么是新 auth 字段，要么是失败原因。
+    """
+    if not cred.get("refresh"):
+        return False, {"reason": "no_refresh_token"}
+
+    url = endpoint.rstrip("/") + REFRESH_PATH
+    req = urllib.request.Request(url, data=b"{}", method="POST")
+    req.add_header("X-Refresh-Token", cred["refresh"])
+    req.add_header("X-Auth-Refresh-Source", "plugin")
+    if cred.get("uid"):
+        req.add_header("X-User-Id", str(cred["uid"]))
+    if cred.get("domain"):
+        req.add_header("X-Domain", str(cred["domain"]))
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            payload = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            payload = {"raw": raw[:300]}
+        return False, {"reason": "http_%s" % e.code, "payload": payload}
+    except urllib.error.URLError as e:
+        return False, {"reason": "network: %s" % e.reason}
+
+    if payload.get("code") not in (0, None):
+        return False, {"reason": "api_code_%s" % payload.get("code"), "payload": payload}
+
+    data = (payload.get("data") or {})
+    if not data.get("accessToken"):
+        return False, {"reason": "empty_token", "payload": payload}
+    return True, {"data": data}
+
+
+def _seal_like(original_value, plaintext):
+    """按原字段的形态写回：原来是明文 str 就写明文，原来是信封就加密。"""
+    if isinstance(original_value, str):
+        return plaintext
+    import at_rest
+    return at_rest.seal(plaintext)
+
+
+def persist_auth(cred, new_auth):
+    """把新 token 加密写回凭据文件（原子替换 + 备份 + 保留其它字段）。
+
+    失败不抛，返回 (ok, msg)，让签到流程能降级继续。
+    """
+    path = cred.get("file")
+    data = cred.get("data")
+    if not path or not isinstance(data, dict):
+        return False, "缺少原始凭据上下文"
+
+    auth = data.get("auth")
+    if not isinstance(auth, dict):
+        return False, "凭据文件缺少 auth 段"
+
+    try:
+        import at_rest
+    except Exception as e:
+        return False, "at_rest 不可用: %s" % e
+
+    lock_path = path + ".wb-lock"
+    if not _claim_lock(lock_path):
+        return False, "凭据文件被占用（另一实例正在写），本次跳过写回"
+
+    tmp_path = path + ".wb-tmp"
+    bak_path = path + ".wb-bak"
+    try:
+        # 写前再确认一次：若文件已被客户端更新，放弃写回（避免覆盖更新的 token）
+        try:
+            with open(path, encoding="utf-8") as fh:
+                latest = json.load(fh)
+            if (latest.get("auth") or {}).get("accessToken") != auth.get("accessToken"):
+                return False, "凭据已被客户端更新，跳过写回"
+        except Exception:
+            pass
+
+        # 先备份原始文件（只保留一份，避免堆积）
+        try:
+            with open(path, "rb") as src, open(bak_path, "wb") as dst:
+                dst.write(src.read())
+        except Exception:
+            pass
+
+        auth["accessToken"] = _seal_like(auth.get("accessToken"), new_auth["accessToken"])
+        if new_auth.get("refreshToken"):
+            auth["refreshToken"] = _seal_like(auth.get("refreshToken"), new_auth["refreshToken"])
+        for k in ("expiresIn", "refreshExpiresIn", "tokenType", "domain", "sessionState"):
+            if new_auth.get(k) is not None:
+                auth[k] = new_auth[k]
+
+        # 时间戳按客户端 calculateExpiresAt 的语义重算
+        now = _now_ms()
+        auth["lastRefreshTime"] = now
+        if new_auth.get("expiresAt"):
+            auth["expiresAt"] = int(new_auth["expiresAt"])
+        elif new_auth.get("expiresIn"):
+            auth["expiresAt"] = now + int(new_auth["expiresIn"]) * 1000
+        if new_auth.get("refreshExpiresAt"):
+            auth["refreshExpiresAt"] = int(new_auth["refreshExpiresAt"])
+        elif new_auth.get("refreshExpiresIn"):
+            auth["refreshExpiresAt"] = now + int(new_auth["refreshExpiresIn"]) * 1000
+
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
+            fh.flush()
+            os.fsync(fh.fileno())
+        # 原子替换：同目录 rename
+        os.replace(tmp_path, path)
+        return True, "已写回 %s" % os.path.basename(path)
+    except Exception as e:
+        for p in (tmp_path,):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+        return False, "写回失败: %s" % e
+    finally:
+        _release_lock(lock_path)
+
+
+def ensure_fresh_cred(cred, endpoint, allow_refresh=True):
+    """如果 accessToken 已过期（或即将过期），先续期。
+
+    写回策略：仅在客户端未运行时落盘。客户端在跑时它可能随时重写凭据文件，
+    我们只把新 token 用于本次运行，避免与客户端争抢文件。
+    实测旧 refreshToken 在续期后仍可用，因此外部续期不会让客户端掉线。
+
+    返回 (cred, note)。续期失败时原样返回，由调用方决定后续行为。
+    """
+    exp = 0
+    try:
+        import base64
+        payload_b64 = cred["token"].split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(payload_b64)).get("exp") or 0
+    except Exception:
+        exp = 0
+
+    remaining = exp - time.time() if exp else None
+    # 留 30 分钟余量，避免签到途中恰好过期
+    if remaining is None or remaining > 1800:
+        return cred, None
+
+    if not allow_refresh:
+        return cred, "token 已过期但已禁用续期（--no-refresh）"
+
+    if not cred.get("refresh"):
+        return cred, "token 已过期且没有 refreshToken，只能重新登录客户端"
+
+    ok, info = refresh_session(cred, endpoint)
+    if not ok:
+        return cred, "自动续期失败（%s）" % info.get("reason")
+
+    new_auth = info["data"]
+    cred2 = dict(cred)
+    cred2["token"] = new_auth["accessToken"]
+    if new_auth.get("refreshToken"):
+        cred2["refresh"] = new_auth["refreshToken"]
+
+    if client_running():
+        return cred2, "已自动续期（客户端在运行，本次不写回凭据文件）"
+
+    wrote, msg = persist_auth(cred, new_auth)
+    if wrote:
+        return cred2, "已自动续期并写回凭据文件"
+    return cred2, "已自动续期（写回失败：%s，仅在本次运行生效）" % msg
+
+
 def ok(status, payload):
     return status == 200 and (not isinstance(payload, dict) or payload.get("code") in (0, None))
 
@@ -299,11 +534,27 @@ def auth_failed(status):
     return status in (401, 403)
 
 
+def call_with_refresh(path, cred, endpoint, allow_refresh=True):
+    """调用接口；若鉴权失效则续期一次并重试。返回 (cred, status, payload, note)。"""
+    status, payload = call(path, cred, endpoint)
+    if not auth_failed(status):
+        return cred, status, payload, None
+
+    cred2, note = ensure_fresh_cred(cred, endpoint, allow_refresh=allow_refresh)
+    if cred2.get("token") == cred.get("token"):
+        return cred, status, payload, note
+
+    status2, payload2 = call(path, cred2, endpoint)
+    return cred2, status2, payload2, note
+
+
 def main():
     ap = argparse.ArgumentParser(description="WorkBuddy 每日签到领积分")
     ap.add_argument("--status", action="store_true", help="只查询状态，不领取")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出状态")
     ap.add_argument("--force", action="store_true", help="强制调用领取接口（调试）")
+    ap.add_argument("--no-refresh", action="store_true",
+                    help="禁止自动续期登录态（只读本地凭据）")
     args = ap.parse_args()
 
     endpoint = os.environ.get("WB_ENDPOINT") or DEFAULT_ENDPOINT
@@ -314,11 +565,20 @@ def main():
         log("[FAIL] 凭据加载失败：%s" % e)
         return 1
 
-    status, payload = call(STATUS_PATH, cred, endpoint)
+    allow_refresh = not args.no_refresh
+
+    cred, status, payload, note = call_with_refresh(
+        STATUS_PATH, cred, endpoint, allow_refresh=allow_refresh)
+    if note:
+        log("[INFO] %s" % note)
+
     if not ok(status, payload):
         if auth_failed(status):
-            log("[FAIL] 鉴权失败（HTTP %s），accessToken 可能已过期。" % status)
-            log("       请打开一次 WorkBuddy 客户端让它刷新登录态，之后会自动恢复。")
+            log("[FAIL] 鉴权失败（HTTP %s），accessToken 已过期且无法自动续期。" % status)
+            if not allow_refresh:
+                log("       本次以 --no-refresh 运行，未尝试续期。")
+            else:
+                log("       请打开一次 WorkBuddy 客户端让它刷新登录态，之后会自动恢复。")
             return 1
         log("[FAIL] 查询状态失败 HTTP %s：%s" % (status, str(payload)[:300]))
         return 1
@@ -347,7 +607,10 @@ def main():
         log("[SKIP] 当前没有进行中的签到活动。")
         return 0
 
-    status2, payload2 = call(CLAIM_PATH, cred, endpoint)
+    cred, status2, payload2, note2 = call_with_refresh(
+        CLAIM_PATH, cred, endpoint, allow_refresh=allow_refresh)
+    if note2 and note2 != note:
+        log("[INFO] %s" % note2)
     if not ok(status2, payload2):
         if auth_failed(status2):
             log("[FAIL] 领取失败，鉴权失效（HTTP %s）。" % status2)
